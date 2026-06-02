@@ -1,0 +1,8 @@
+[package]
+name = "pdf_benford"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pdf-extract = "0.7.1"
+regex = "1.10"

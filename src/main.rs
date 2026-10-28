@@ -1,8 +1,17 @@
+use regex::Regex;
 use std::collections::HashMap;
 use std::env;
-use std::fs::File;
 use std::path::Path;
-use regex::Regex;
+
+struct DigitAnalysis {
+    digit: char,
+    observed_count: usize,
+    observed_pct: f64,
+    expected_count: f64,
+    expected_pct: f64,
+    z_score: f64,
+    flagged: bool,
+}
 
 fn main() {
     // 1. Gather command line arguments
@@ -34,9 +43,8 @@ fn main() {
     };
 
     // 3. Regex to match numerical sequences
-    // Matches digits, accounting for commas/periods as decimal or thousands separators
     let num_regex = Regex::new(r"\b\d[\d,.]*\b").unwrap();
-    
+
     let mut counts: HashMap<char, usize> = HashMap::new();
     let mut total_valid_numbers = 0;
 
@@ -56,48 +64,82 @@ fn main() {
         }
     }
 
-    if total_valid_numbers <= 0 {
+    if total_valid_numbers == 0 {
         println!("No valid numbers with a leading digit of 1-9 were found in the PDF.");
         return;
     }
 
-    // 5. Calculate Benford's Law Expected Percentages
-    // P(d) = log10(1 + 1/d)
-    let mut benford_pcts = HashMap::new();
+    let n = total_valid_numbers as f64;
+
+    // 5. Compute Expected Frequencies, Chi-Square, and Z-Scores
+    let mut chi_square = 0.0;
+    let mut digit_analyses: Vec<DigitAnalysis> = Vec::new();
+
+    // Critical Z-score for alpha = 0.05 (two-tailed test)
+    let z_critical = 1.96;
+
     for d in 1..=9 {
         let digit_char = char::from_digit(d, 10).unwrap();
-        let pct = ((1.0 + 1.0 / (d as f64)).log10()) * 100.0;
-        benford_pcts.insert(digit_char, pct);
+        let obs_count = *counts.get(&digit_char).unwrap_or(&0);
+        let obs_pct = (obs_count as f64 / n) * 100.0;
+
+        // Expected probability P(d) = log10(1 + 1/d)
+        let exp_prob = (1.0 + 1.0 / (d as f64)).log10();
+        let exp_pct = exp_prob * 100.0;
+        let exp_count = exp_prob * n;
+
+        // Contribution to Chi-Square: (O - E)^2 / E
+        let diff = obs_count as f64 - exp_count;
+        chi_square += (diff * diff) / exp_count;
+
+        // Z-score calculation with continuity correction (1 / 2n)
+        let obs_prop = obs_count as f64 / n;
+        let std_dev = (exp_prob * (1.0 - exp_prob) / n).sqrt();
+        let continuity_correction = 0.5 / n;
+        
+        let z_score = if std_dev > 0.0 {
+            let numerator = (obs_prop - exp_prob).abs() - continuity_correction;
+            if numerator > 0.0 {
+                (numerator / std_dev) * (obs_prop - exp_prob).signum()
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        let flagged = z_score.abs() > z_critical;
+
+        digit_analyses.push(DigitAnalysis {
+            digit: digit_char,
+            observed_count: obs_count,
+            observed_pct: obs_pct,
+            expected_count: exp_count,
+            expected_pct: exp_pct,
+            z_score,
+            flagged,
+        });
     }
 
-    // 6. Render Results to Terminal
+    // 6. Render Terminal Results
     println!("\n=== Analysis Complete ===");
     println!("Total numbers analyzed: {}\n", total_valid_numbers);
 
+    // Distribution Comparison Table
     println!("Digit | Observed Freq | Benford Freq  | Distribution Comparison (Observed: #, Benford: *)");
     println!("------+---------------+---------------+---------------------------------------------------");
 
-    for d in 1..=9 {
-        let digit_char = char::from_digit(d, 10).unwrap();
-        
-        // Observed calculation
-        let observed_count = *counts.get(&digit_char).unwrap_or(&0);
-        let observed_pct = (observed_count as f64 / total_valid_numbers as f64) * 100.0;
-        
-        // Expected calculation
-        let benford_pct = benford_pcts[&digit_char];
-
-        // Generate ASCII bar charts (scale: 1 character per 1.5%)
+    for analysis in &digit_analyses {
         let scale = 1.5;
-        let observed_bar_len = (observed_pct / scale).round() as usize;
-        let benford_bar_len = (benford_pct / scale).round() as usize;
+        let observed_bar_len = (analysis.observed_pct / scale).round() as usize;
+        let benford_bar_len = (analysis.expected_pct / scale).round() as usize;
 
         let observed_bar = "#".repeat(observed_bar_len);
         let benford_bar = "*".repeat(benford_bar_len);
 
         println!(
             "  {}   |  {:>5.1}% ({:>4}) |   {:>5.1}%     | Obs: {}",
-            digit_char, observed_pct, observed_count, benford_pct, observed_bar
+            analysis.digit, analysis.observed_pct, analysis.observed_count, analysis.expected_pct, observed_bar
         );
         println!(
             "      |               |               | Ben: {}",
@@ -105,4 +147,63 @@ fn main() {
         );
         println!("------+---------------+---------------+---------------------------------------------------");
     }
+
+    // Calculate Nigrini's Mean Absolute Deviation (MAD)
+    let mut total_abs_dev = 0.0;
+    for d in 1..=9 {
+        let digit_char = char::from_digit(d, 10).unwrap();
+        let obs_count = *counts.get(&digit_char).unwrap_or(&0);
+        let obs_prop = obs_count as f64 / n;
+        let exp_prob = (1.0 + 1.0 / (d as f64)).log10();
+        
+        total_abs_dev += (obs_prop - exp_prob).abs();
+    }
+    let mad = total_abs_dev / 9.0;
+
+    println!("\n=== Nigrini's Mean Absolute Deviation (MAD) ===");
+    println!("MAD Score: {:.5}", mad);
+    if mad <= 0.006 {
+        println!("Conformity: Close Conformity");
+    } else if mad <= 0.012 {
+        println!("Conformity: Acceptable Conformity");
+    } else if mad <= 0.015 {
+        println!("Conformity: Marginally Non-Conforming");
+    } else {
+        println!("Conformity: Non-Conforming");
+    }
+
+    // 7. Overall Chi-Square Statistic Output
+    let chi_critical = 15.51;
+    let chi_exceeded = chi_square > chi_critical;
+
+    println!("\n=== Chi-Square Goodness-of-Fit Test ===");
+    println!("Chi-Square Statistic (\u{03C7}\u{00B2}): {:.4}", chi_square);
+    println!("Critical Threshold (\u{03B1} = 0.05, df = 8): {:.2}", chi_critical);
+    if chi_exceeded {
+        println!("Result: EXCEEDS threshold ({:.4} > {:.2}). The dataset significantly deviates from Benford's Law.", chi_square, chi_critical);
+    } else {
+        println!("Result: DOES NOT exceed threshold ({:.4} <= {:.2}). The dataset conforms to Benford's Law.", chi_square, chi_critical);
+    }
+
+    // 8. Individual Digit Z-Score Table (Sorted highest to lowest Z-Score magnitude)
+    let mut sorted_analyses = digit_analyses;
+    sorted_analyses.sort_by(|a, b| b.z_score.abs().partial_cmp(&a.z_score.abs()).unwrap());
+
+    println!("\n=== Individual Digit Z-Score Analysis ===");
+    println!("Sorted by absolute deviation magnitude (Critical |Z| = 1.96, \u{03B1} = 0.05)\n");
+    println!(" Digit | Obs Count | Exp Count | Obs Pct | Exp Pct |  Z-Score  | Flagged for Review ");
+    println!("-------+-----------+-----------+---------+---------+-----------+--------------------");
+
+    for a in &sorted_analyses {
+        let flag_str = if a.flagged {
+            "YES [FLAGGED]"
+        } else {
+            "No"
+        };
+        println!(
+            "   {}   |   {:>6}  |  {:>8.1} |  {:>5.1}% |  {:>5.1}% |  {:>+8.3}  | {}",
+            a.digit, a.observed_count, a.expected_count, a.observed_pct, a.expected_pct, a.z_score, flag_str
+        );
+    }
+    println!("------------------------------------------------------------------------------------\n");
 }
